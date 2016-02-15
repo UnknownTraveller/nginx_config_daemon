@@ -93,7 +93,7 @@ char* read_entire_file(char* path) {
     fseek(f, 0, SEEK_END);
     
     size_t bufferLen = 0;
-    size_t bufferCapacity = ftell(f);
+    size_t bufferCapacity = ftell(f) + 1;
     char* buffer = malloc(bufferCapacity);
 
     rewind(f);
