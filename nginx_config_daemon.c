@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 500
+
 #include <stdlib.h>
 #include <stdio.h> // files
 #include <string.h> // memory
@@ -7,6 +9,8 @@
 #include <dirent.h> // list directories
 #include <utmp.h> // utmp file (logged in users)
 #include <pwd.h> // getpwdnam (find uid from user name from utmp file)
+
+#include <sys/stat.h>
 #include <sys/inotify.h> // watch files
 
 #include <libnotify/notify.h> // libnotify
@@ -26,7 +30,7 @@
 // override default malloc and free to have some more error checking
 #define free(PTR) (free(PTR), PTR = 0)
 #define malloc(SIZE) PCHECKED(calloc(SIZE, sizeof(char)))
-
+#define realloc(BUF, SIZE) PCHECKED(realloc(BUF, SIZE))
 
 void die(const char* msg) {
     perror(msg);
@@ -41,16 +45,25 @@ ssize_t __checked(char* statement, ssize_t result, int err_value) {
 void notify_user(int uid, char* caption, char* message, char* icon) {
     int cpid = fork();
     if (cpid == 0) { // child
-        setuid(uid);
-        
-        notify_init("nginx");
-        NotifyNotification* notification = notify_notification_new(caption, message, icon);
-        notify_notification_show(notification, NULL);
+        ICHECKED(setuid(uid), -1);
+
+        ICHECKED(notify_init("nginx"), FALSE);
+        NotifyNotification* notification = PCHECKED(notify_notification_new(caption, message, icon));
+
+        GError* showError = NULL;
+
+        notify_notification_show(notification, &showError);
+
+        if(showError != NULL) {
+            die(showError->message);
+        }
+
         g_object_unref(G_OBJECT(notification));
         notify_uninit();
 
         exit(0);
     } else if(cpid > 0) {
+        printf("NOTIFY %d: %s - %s\n", uid, caption, message);
         return; // nothing to do in the host anymore
     } else {
         die("fork()");
@@ -58,6 +71,8 @@ void notify_user(int uid, char* caption, char* message, char* icon) {
 }
 
 void notify_all_users(char* caption, char* message, char* icon) {
+    printf("NOTIFY: %s - %s\n", caption, message);
+
     FILE* ufp = PCHECKED(fopen(_PATH_UTMP, "r"));
 
     struct utmp utmp_entry;
@@ -73,6 +88,40 @@ void notify_all_users(char* caption, char* message, char* icon) {
     fclose(ufp);
 }
 
+char* read_entire_file(char* path) {
+    FILE* f = PCHECKED(fopen(path, "r"));
+    fseek(f, 0, SEEK_END);
+    
+    size_t bufferLen = 0;
+    size_t bufferCapacity = ftell(f);
+    char* buffer = malloc(bufferCapacity);
+
+    rewind(f);
+    
+    size_t bytesRead;
+    while((bytesRead = fread(buffer + bufferLen, sizeof(char), bufferCapacity - bufferLen, f)) > 0) {
+        bufferLen += bytesRead;
+        if (bufferCapacity - bufferLen <= 1) {
+            bufferCapacity += 4096;
+            buffer = realloc(buffer, bufferCapacity);
+        }
+    }
+
+    fclose(f);
+
+    buffer = realloc(buffer, bufferLen + 1);
+    return buffer;
+}
+
+void write_entire_file(char* path, char* contents, size_t contentLen) {
+    if (contentLen == 0) {
+        contentLen = strlen(contents);
+    }
+
+    FILE* f = PCHECKED(fopen(path, "w"));
+    ICHECKED(fwrite(contents, sizeof(char), contentLen, f), contentLen);
+    fclose(f);
+}
 
 struct SMultiWatch;
 typedef struct SMultiWatch MultiWatch;
@@ -97,6 +146,8 @@ int multi_watch_add(MultiWatch* watch, char* path, int mask, inotify_event_handl
 
         FD_ZERO(&watch->watch_handles_set);
     }
+
+    printf("watch directory '%s'...\n", path);
 
     int watchHandle = ICHECKED(inotify_add_watch(watch->inotify_handle, path, mask), -1);
 
@@ -145,17 +196,44 @@ void update_config(MultiWatch* watch, struct inotify_event* event) {
 
 void add_nginx_config(MultiWatch* watch, char* vhost) {
     char* filepath = malloc(9 + strlen(vhost) + 7 + 1); // 9:/var/www/ 7:/.nginx 1:\0
+    char *dirpath = malloc(9 + strlen(vhost) + 1);
 
-    strcpy(filepath, "/var/wwww/");
-    strcat(filepath, vhost);
+    strcpy(dirpath, "/var/www/");
+    strcat(dirpath, vhost);
+    
+    strcpy(filepath, dirpath);
     strcat(filepath, "/.nginx");
 
+    printf("add vhost '%s', check for file '%s'\n", vhost, filepath);
+
     if (access(filepath, F_OK) == -1 && errno == ENOENT) {
-        // copy("/var/nginx/.nginx.default", filepath);
+        char* configFile = read_entire_file("/etc/nginx/.nginx.default");
+        char* last_vhost_pos = configFile;
+        char* next_vhost_pos;
+
+        FILE* outputFile = PCHECKED(fopen(filepath, "w"));
+
+        while((next_vhost_pos = strstr(last_vhost_pos, "$VHOST")) != NULL) {
+            fwrite(last_vhost_pos, sizeof(char), next_vhost_pos - last_vhost_pos, outputFile);
+            fwrite(vhost, sizeof(char), strlen(vhost), outputFile);
+            last_vhost_pos = next_vhost_pos + 6;
+        }
+
+        fwrite(last_vhost_pos, sizeof(char), strlen(last_vhost_pos), outputFile);
+
+        struct stat dirstats;
+        stat(dirpath, &dirstats);
+
+        fchmod(fileno(outputFile), 0775);
+        fchown(fileno(outputFile), dirstats.st_uid, dirstats.st_gid);
+
+        fclose(outputFile);
+        free(configFile);
     }
 
     multi_watch_add(watch, filepath, IN_CLOSE_WRITE, update_config);
     free(filepath);
+    free(dirpath);
 }
 
 void new_virtualhost(MultiWatch* watch, struct inotify_event* event) {
@@ -163,7 +241,7 @@ void new_virtualhost(MultiWatch* watch, struct inotify_event* event) {
     // add host to /etc/hosts file
     FILE* etc_hosts = fopen("/etc/hosts", "a");
     if (etc_hosts) {
-        fputs("127.0.0.1\t\t", etc_hosts);
+        fputs("127.0.0.1\t", etc_hosts);
         fputs(event->name, etc_hosts);
         fputs(".local\n", etc_hosts);
         fclose(etc_hosts);
@@ -186,12 +264,6 @@ void new_virtualhost(MultiWatch* watch, struct inotify_event* event) {
 
 int main(int argc, char** argv) {
 
-    ICHECKED(1 + 5*3, 16);
-
-    notify_all_users("Hallo, Welt!", "Diese Nachricht wurde direkt über libnotify an alle angemeldeten grafischen Benutzer gesendet!", NOTIFY_ICON_INFORMATION);
-
-    return 0;
-
     MultiWatch watch = {};
     
     //monitor default nginx config file.    
@@ -205,7 +277,9 @@ int main(int argc, char** argv) {
 
     struct dirent *dirp;
     while ((dirp = readdir(var_www)) != NULL) {
-        add_nginx_config(&watch, dirp->d_name);
+        if(strcmp(dirp->d_name, "..") != 0 && strcmp(dirp->d_name, ".") != 0) {
+            add_nginx_config(&watch, dirp->d_name);
+        }
     }
 
     closedir(var_www);
